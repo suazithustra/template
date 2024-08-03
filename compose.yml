@@ -1,49 +1,87 @@
 services:
-  oathkeeper:
-    image: oryd/oathkeeper:v0.40
-    depends_on:
-      - kratos-selfservice-ui-node
-    ports:
-      - 4455:4455 # proxy
-      - 4456:4456 # api
-    command:
-      serve proxy -c "/etc/config/oathkeeper/oathkeeper.yml"
-    environment:
-      - LOG_LEVEL=debug
-    restart: on-failure
-    networks:
-      - intranet
-    volumes:
-      - ./oathkeeper:/etc/config/oathkeeper
+  # nginx:
+  #   image: nginx
+  #   ports:
+  #     - "8080:80"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #   networks:
+  #     - intranet
 
-  kratos-selfservice-ui-node:
+  # oathkeeper:
+  #   image: oryd/oathkeeper:v0.40
+  #   depends_on:
+  #     - selfservice-ui
+  #   ports:
+  #     - 4455:4455 # proxy
+  #     - 4456:4456 # api
+  #   command: serve proxy -c "/etc/config/oathkeeper/oathkeeper.yml"
+  #   environment:
+  #     - LOG_LEVEL=debug
+  #   restart: on-failure
+  #   networks:
+  #     - intranet
+  #   volumes:
+  #     - ./oathkeeper:/etc/config/oathkeeper:ro
+
+  selfservice-ui:
     image: oryd/kratos-selfservice-ui-node:v1.1.0
     depends_on:
       - kratos
     environment:
       - PORT=4435
-      - KRATOS_PUBLIC_URL=http://kratos:4433/
+      - KRATOS_PUBLIC_URL=http://kratos:4433
       - KRATOS_BROWSER_URL=http://127.0.0.1:4455/.ory/kratos/public
       - JWKS_URL=http://oathkeeper:4456/.well-known/jwks.json
       - SECURITY_MODE=jwks
       - COOKIE_SECRET=changeme
       - CSRF_COOKIE_NAME=ory_csrf_ui
       - CSRF_COOKIE_SECRET=changeme
+    # restart: on-failure
     networks:
       - intranet
-    restart: on-failure
 
-  kratos-migrate:
-    image: oryd/kratos:v1.1.0
-    depends_on:
-      - cockroachdb
+  spicedb:
+    image: authzed/spicedb
+    command: serve
+    # restart: always
+    # ports:
+    #   - "8079:8080"
+    #   - "9090:9090"
+    #   - "50051:50051"
     environment:
-      - DSN=cockroach://root@cockroachdb:26257/defaultdb?sslmode=disable&max_conns=20&max_idle_conns=4
-      - LOG_LEVEL=debug
-    volumes:
-      - ./kratos:/etc/config/kratos
-    command: -c /etc/config/kratos/kratos.yml migrate sql -e --yes
+      - SPICEDB_GRPC_PRESHARED_KEY=foobar
+      - SPICEDB_DATASTORE_ENGINE=cockroachdb
+      - SPICEDB_DATASTORE_CONN_URI=postgresql://root@cockroachdb:26257/spicedb?sslmode=disable
+      - SPICEDB_LOG_FORMAT=console
+      - SPICEDB_LOG_LEVEL=info
+    depends_on:
+      - spicedb-migrate
+    networks:
+      - intranet
+
+  spicedb-migrate:
+    image: authzed/spicedb
+    command: migrate head
     restart: on-failure
+    environment:
+      - SPICEDB_DATASTORE_ENGINE=cockroachdb
+      - SPICEDB_DATASTORE_CONN_URI=postgresql://root@cockroachdb:26257/spicedb?sslmode=disable
+      - SPICEDB_LOG_FORMAT=console
+      - SPICEDB_LOG_LEVEL=debug
+    depends_on:
+      - cockroachdb-init
+    networks:
+      - intranet
+
+  kratos-admin-ui:
+    image: ghcr.io/dfoxg/kratos-admin-ui:v2.3.2
+    ports:
+      - "8081:8080"
+    # restart: unless-stopped
+    environment:
+      - KRATOS_PUBLIC_URL=http://kratos:4433
+      - KRATOS_ADMIN_URL=http://kratos:4434
     networks:
       - intranet
 
@@ -51,42 +89,87 @@ services:
     depends_on:
       - kratos-migrate
     image: oryd/kratos:v1.1.0
-    ports:
-      - '4433:4433' # public
-      - '4434:4434' # admin
-    restart: unless-stopped
+    # ports:
+    #   - "4433:4433" # public
+    #   - "4434:4434" # admin
+    # restart: unless-stopped
     environment:
-      - DSN=cockroach://root@cockroachdb:26257/defaultdb?sslmode=disable&max_conns=20&max_idle_conns=4
+      - DSN=cockroach://root@cockroachdb:26257/kratos?sslmode=disable&max_conns=20&max_idle_conns=4
       - SERVE_PUBLIC_BASE_URL=http://127.0.0.1:4455/.ory/kratos/public/
       - LOG_LEVEL=debug
     command: serve -c /etc/config/kratos/kratos.yml --dev --watch-courier --sqa-opt-out
     volumes:
-      - ./kratos:/etc/config/kratos
+      - ./kratos:/etc/config/kratos:ro
     networks:
       - intranet
 
-  mailslurper:
+  kratos-migrate:
+    image: oryd/kratos:v1.1.0
+    depends_on:
+      - cockroachdb
+    environment:
+      - DSN=cockroach://root@cockroachdb:26257/kratos?sslmode=disable&max_conns=20&max_idle_conns=4
+      - LOG_LEVEL=debug
+    volumes:
+      - ./kratos:/etc/config/kratos:ro
+    command: -c /etc/config/kratos/kratos.yml migrate sql -e --yes
+    # restart: on-failure
+    networks:
+      - intranet
+
+  cockroachdb-settings:
+    image: cockroachdb/cockroach:latest-v23.2
+    depends_on:
+      - cockroachdb-init
+    # restart: on-failure
+    command: sql -e 'SET CLUSTER SETTING kv.rangefeed.enabled = true;'
+    environment:
+      - COCKROACH_INSECURE=true
+      - COCKROACH_HOST=cockroachdb:26257
+    networks:
+      - intranet
+
+  cockroachdb-init:
+    image: cockroachdb/cockroach:latest-v23.2
+    depends_on:
+      - cockroachdb
+    # restart: on-failure
+    command: |
+      sql -e '
+      CREATE DATABASE IF NOT EXISTS kratos;
+      CREATE DATABASE IF NOT EXISTS spicedb;
+      CREATE DATABASE IF NOT EXISTS template;
+      '
+    environment:
+      - COCKROACH_INSECURE=true
+      - COCKROACH_HOST=cockroachdb:26257
+    networks:
+      - intranet
+
+  mailslurper: # fake SMTP server
     image: oryd/mailslurper:latest-smtps
+    platform: linux/amd64
     ports:
-      - '4436:4436'
-      - '4437:4437'
+      - "4436:4436"
+      - "4437:4437"
     networks:
       - intranet
 
   cockroachdb:
     image: cockroachdb/cockroach:latest-v23.2
+    # command: start --join=template-cockroachdb-1,template-cockroachdb-2,template-cockroachdb-3 --insecure
     command: start-single-node --insecure
     ports:
-      # - '8080:8080'
-      - '26257:26257'
+      - "8080:8080"
+      - "26257:26257"
     volumes:
       - cockroachdb-data:/cockroach/cockroach-data
-    healthcheck:
-      test: curl --fail http://localhost:8080/health?ready=1 || exit 1
-      interval: 2s
-      retries: 3
-      start_period: 15s
-      timeout: 5s
+    # healthcheck:
+    #   test: curl --fail http://localhost:8080/health?ready=1 || exit 1
+    #   interval: 2s
+    #   retries: 3
+    #   start_period: 15s
+    #   timeout: 5s
     networks:
       - intranet
 
